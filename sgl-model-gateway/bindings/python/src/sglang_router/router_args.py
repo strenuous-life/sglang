@@ -54,6 +54,8 @@ class RouterArgs:
     # PD service discovery configuration
     prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     decode_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
+    prefill_service_discovery_ports: List[int] = dataclasses.field(default_factory=list)
+    decode_service_discovery_ports: List[int] = dataclasses.field(default_factory=list)
     bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
     # Prometheus configuration
     prometheus_port: Optional[int] = None
@@ -458,6 +460,20 @@ class RouterArgs:
             nargs="+",
             default={},
             help="Label selector for decode server pods in PD mode (format: key1=value1 key2=value2)",
+        )
+        k8s_group.add_argument(
+            f"--{prefix}prefill-service-discovery-ports",
+            type=int,
+            nargs="+",
+            default=[],
+            help="Ports to use for discovered prefill pods in PD mode (can specify multiple ports). If not specified, uses service-discovery-ports.",
+        )
+        k8s_group.add_argument(
+            f"--{prefix}decode-service-discovery-ports",
+            type=int,
+            nargs="+",
+            default=[],
+            help="Ports to use for discovered decode pods in PD mode (can specify multiple ports). If not specified, uses service-discovery-ports.",
         )
         # Prometheus configuration
         prometheus_group.add_argument(

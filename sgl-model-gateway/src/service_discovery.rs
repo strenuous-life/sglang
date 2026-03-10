@@ -38,6 +38,12 @@ pub struct ServiceDiscoveryConfig {
     pub port: u16,
     /// List of ports to use for discovered worker pods
     pub ports: Vec<u16>,
+    /// List of ports to use for discovered prefill pods in PD mode
+    /// If not specified, falls back to `ports`
+    pub prefill_ports: Vec<u16>,
+    /// List of ports to use for discovered decode pods in PD mode
+    /// If not specified, falls back to `ports`
+    pub decode_ports: Vec<u16>,
     pub namespace: Option<String>,
     // PD mode specific configuration
     pub pd_mode: bool,
@@ -58,6 +64,8 @@ impl Default for ServiceDiscoveryConfig {
             check_interval: Duration::from_secs(60),
             port: 8000,
             ports: vec![8000],
+            prefill_ports: vec![],
+            decode_ports: vec![],
             namespace: None,
             pd_mode: false,
             prefill_selector: HashMap::new(),
@@ -286,11 +294,6 @@ pub async fn start_service_discovery(
         debug!("K8s service discovery initialized");
 
         let config_arc = Arc::new(config.clone());
-        let ports = if config_arc.ports.is_empty() {
-            vec![config_arc.port]
-        } else {
-            config_arc.ports.clone()
-        };
 
         // Spawn router discovery task if enabled and mesh is available
         // Router discovery requires mesh to be enabled to update cluster state
@@ -343,25 +346,64 @@ pub async fn start_service_discovery(
             let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
             let app_context_clone = Arc::clone(&app_context);
             let config_clone2 = Arc::clone(&config_arc);
-            let ports_clone = ports.clone();
 
             match filtered_stream
                 .try_for_each(move |pod| {
                     let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
                     let app_context_inner = Arc::clone(&app_context_clone);
                     let config_inner = Arc::clone(&config_clone2);
-                    let ports_inner = ports_clone.clone();
 
                     async move {
                         let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
 
                         if let Some(pod_info) = pod_info {
+                            // Determine the ports to use based on pod type
+                            let ports = if config_inner.pd_mode {
+                                match &pod_info.pod_type {
+                                    Some(PodType::Prefill) => {
+                                        if config_inner.prefill_ports.is_empty() {
+                                            if config_inner.ports.is_empty() {
+                                                vec![config_inner.port]
+                                            } else {
+                                                config_inner.ports.clone()
+                                            }
+                                        } else {
+                                            config_inner.prefill_ports.clone()
+                                        }
+                                    }
+                                    Some(PodType::Decode) => {
+                                        if config_inner.decode_ports.is_empty() {
+                                            if config_inner.ports.is_empty() {
+                                                vec![config_inner.port]
+                                            } else {
+                                                config_inner.ports.clone()
+                                            }
+                                        } else {
+                                            config_inner.decode_ports.clone()
+                                        }
+                                    }
+                                    _ => {
+                                        if config_inner.ports.is_empty() {
+                                            vec![config_inner.port]
+                                        } else {
+                                            config_inner.ports.clone()
+                                        }
+                                    }
+                                }
+                            } else {
+                                if config_inner.ports.is_empty() {
+                                    vec![config_inner.port]
+                                } else {
+                                    config_inner.ports.clone()
+                                }
+                            };
+
                             if pod.metadata.deletion_timestamp.is_some() {
                                 handle_pod_deletion(
                                     &pod_info,
                                     tracked_pods_inner,
                                     app_context_inner,
-                                    &ports_inner,
+                                    &ports,
                                 )
                                 .await;
                             } else {
@@ -369,7 +411,7 @@ pub async fn start_service_discovery(
                                     &pod_info,
                                     tracked_pods_inner,
                                     app_context_inner,
-                                    &ports_inner,
+                                    &ports,
                                     config_inner.pd_mode,
                                 )
                                 .await;
@@ -897,6 +939,8 @@ mod tests {
             check_interval: Duration::from_secs(60),
             port: 8080,
             ports: vec![8080],
+            prefill_ports: vec![],
+            decode_ports: vec![],
             namespace: None,
             pd_mode: true,
             prefill_selector,

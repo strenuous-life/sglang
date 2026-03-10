@@ -252,6 +252,22 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     decode_selector: Vec<String>,
 
+    /// Ports to use for discovered prefill pods in PD mode (can specify multiple ports)
+    #[arg(
+        long,
+        num_args = 0..,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    prefill_service_discovery_ports: Vec<u16>,
+
+    /// Ports to use for discovered decode pods in PD mode (can specify multiple ports)
+    #[arg(
+        long,
+        num_args = 0..,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    decode_service_discovery_ports: Vec<u16>,
+
     // ==================== Logging ====================
     /// Directory to store log files
     #[arg(long, help_heading = "Logging")]
@@ -900,6 +916,16 @@ impl CliArgs {
                 } else {
                     self.service_discovery_ports.clone()
                 },
+                prefill_ports: if self.prefill_service_discovery_ports.is_empty() {
+                    vec![]
+                } else {
+                    self.prefill_service_discovery_ports.clone()
+                },
+                decode_ports: if self.decode_service_discovery_ports.is_empty() {
+                    vec![]
+                } else {
+                    self.decode_service_discovery_ports.clone()
+                },
                 check_interval_secs: 60,
                 selector: Self::parse_selector(&self.selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
@@ -1062,6 +1088,16 @@ impl CliArgs {
                     vec![80]
                 } else {
                     self.service_discovery_ports.clone()
+                },
+                prefill_ports: if self.prefill_service_discovery_ports.is_empty() {
+                    vec![]
+                } else {
+                    self.prefill_service_discovery_ports.clone()
+                },
+                decode_ports: if self.decode_service_discovery_ports.is_empty() {
+                    vec![]
+                } else {
+                    self.decode_service_discovery_ports.clone()
                 },
                 namespace: self.service_discovery_namespace.clone(),
                 pd_mode: self.pd_disaggregation,
