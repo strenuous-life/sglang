@@ -14,7 +14,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -42,7 +42,7 @@ strategy_to_parameter_type = {
 }
 
 
-class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
+class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
     def __init__(self, weight_quant: QuantizationArgs, is_static_input_scheme: bool):
         self.weight_quant = weight_quant
         self.strategy = self.weight_quant.strategy
@@ -106,14 +106,12 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 weight_loader=weight_loader,
             )
             weight_scale[:] = torch.finfo(torch.float32).min
-            layer.register_parameter("weight_scale", weight_scale)
         elif self.strategy == QuantizationStrategy.TENSOR:
             weight_scale = PerTensorScaleParameter(
                 data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
                 weight_loader=weight_loader,
             )
             weight_scale[:] = torch.finfo(torch.float32).min
-            layer.register_parameter("weight_scale", weight_scale)
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert layer.weight_block_size is not None
             block_n, block_k = layer.weight_block_size[0], layer.weight_block_size[1]
@@ -130,8 +128,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             )
             weight_scale.format_ue8m0 = False
             weight_scale[:] = torch.finfo(torch.float32).min
-            layer.register_parameter("weight_scale_inv", weight_scale)
 
+        layer.register_parameter("weight_scale", weight_scale)
         # INPUT SCALE
         if self.is_static_input_scheme:
             input_scale = PerTensorScaleParameter(
@@ -190,16 +188,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
             weight = layer.weight
-            weight_scale_inv = layer.weight_scale_inv
+            weight_scale = layer.weight_scale
 
             if is_fp8_fnuz():
-                weight, weight_scale_inv, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=weight, weight_scale=weight_scale_inv
+                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=weight, weight_scale=weight_scale
                 )
             layer.weight = Parameter(weight.data, requires_grad=False)
-            layer.weight_scale_inv = Parameter(
-                weight_scale_inv.data, requires_grad=False
-            )
+            layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
@@ -221,7 +217,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 input=x,
                 weight=layer.weight,
                 block_size=self.weight_block_size,
-                weight_scale=layer.weight_scale_inv,
+                weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
             )
