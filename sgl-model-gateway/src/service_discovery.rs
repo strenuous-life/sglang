@@ -34,7 +34,10 @@ pub struct ServiceDiscoveryConfig {
     pub enabled: bool,
     pub selector: HashMap<String, String>,
     pub check_interval: Duration,
+    /// Primary port (for backwards compatibility, first port in ports list)
     pub port: u16,
+    /// List of ports to use for discovered worker pods
+    pub ports: Vec<u16>,
     pub namespace: Option<String>,
     // PD mode specific configuration
     pub pd_mode: bool,
@@ -54,6 +57,7 @@ impl Default for ServiceDiscoveryConfig {
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
             port: 8000,
+            ports: vec![8000],
             namespace: None,
             pd_mode: false,
             prefill_selector: HashMap::new(),
@@ -282,7 +286,11 @@ pub async fn start_service_discovery(
         debug!("K8s service discovery initialized");
 
         let config_arc = Arc::new(config.clone());
-        let port = config.port;
+        let ports = if config_arc.ports.is_empty() {
+            vec![config_arc.port]
+        } else {
+            config_arc.ports.clone()
+        };
 
         // Spawn router discovery task if enabled and mesh is available
         // Router discovery requires mesh to be enabled to update cluster state
@@ -335,12 +343,14 @@ pub async fn start_service_discovery(
             let tracked_pods_clone2 = Arc::clone(&tracked_pods_clone);
             let app_context_clone = Arc::clone(&app_context);
             let config_clone2 = Arc::clone(&config_arc);
+            let ports_clone = ports.clone();
 
             match filtered_stream
                 .try_for_each(move |pod| {
                     let tracked_pods_inner = Arc::clone(&tracked_pods_clone2);
                     let app_context_inner = Arc::clone(&app_context_clone);
                     let config_inner = Arc::clone(&config_clone2);
+                    let ports_inner = ports_clone.clone();
 
                     async move {
                         let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
@@ -351,7 +361,7 @@ pub async fn start_service_discovery(
                                     &pod_info,
                                     tracked_pods_inner,
                                     app_context_inner,
-                                    port,
+                                    &ports_inner,
                                 )
                                 .await;
                             } else {
@@ -359,7 +369,7 @@ pub async fn start_service_discovery(
                                     &pod_info,
                                     tracked_pods_inner,
                                     app_context_inner,
-                                    port,
+                                    &ports_inner,
                                     config_inner.pd_mode,
                                 )
                                 .await;
@@ -400,59 +410,60 @@ async fn handle_pod_event(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
-    port: u16,
+    ports: &[u16],
     pd_mode: bool,
 ) {
-    let worker_url = pod_info.worker_url(port);
-
-    if pod_info.is_healthy() {
-        // Track whether to add and get count in single lock acquisition
-        let (should_add, tracked_count) = {
-            let mut tracker = match tracked_pods.lock() {
-                Ok(tracker) => tracker,
-                Err(e) => {
-                    error!("Failed to acquire tracked_pods lock: {}", e);
-                    return;
-                }
-            };
-
-            if tracker.contains(pod_info) {
-                (false, tracker.len())
-            } else {
-                tracker.insert(pod_info.clone());
-                (true, tracker.len())
+    // Track whether to add and get count in single lock acquisition
+    let (should_add, tracked_count) = {
+        let mut tracker = match tracked_pods.lock() {
+            Ok(tracker) => tracker,
+            Err(e) => {
+                error!("Failed to acquire tracked_pods lock: {}", e);
+                return;
             }
         };
 
-        if should_add {
+        if tracker.contains(pod_info) {
+            (false, tracker.len())
+        } else {
+            tracker.insert(pod_info.clone());
+            (true, tracker.len())
+        }
+    };
+
+    if should_add && pod_info.is_healthy() {
+        let worker_type = if pd_mode {
+            match &pod_info.pod_type {
+                Some(PodType::Prefill) => Some("prefill".to_string()),
+                Some(PodType::Decode) => Some("decode".to_string()),
+                Some(PodType::Regular) | None => None,
+            }
+        } else {
+            None
+        };
+
+        let bootstrap_port = if pd_mode {
+            match &pod_info.pod_type {
+                Some(PodType::Prefill) => pod_info.bootstrap_port,
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Create a worker for each port
+        for port in ports {
+            let worker_url = pod_info.worker_url(*port);
+
             info!(
                 "Adding pod: {} | type: {:?} | url: {}",
                 pod_info.name, pod_info.pod_type, worker_url
             );
 
-            let worker_type = if pd_mode {
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => Some("prefill".to_string()),
-                    Some(PodType::Decode) => Some("decode".to_string()),
-                    Some(PodType::Regular) | None => None,
-                }
-            } else {
-                None
-            };
-
-            let bootstrap_port = if pd_mode {
-                match &pod_info.pod_type {
-                    Some(PodType::Prefill) => pod_info.bootstrap_port,
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
             let config = WorkerConfigRequest {
                 url: worker_url.clone(),
                 model_id: None,
-                worker_type,
+                worker_type: worker_type.clone(),
                 priority: None,
                 cost: None,
                 runtime: None,
@@ -490,12 +501,6 @@ async fn handle_pod_event(
                             metrics_labels::DISCOVERY_KUBERNETES,
                             metrics_labels::REGISTRATION_SUCCESS,
                         );
-
-                        // Update workers discovered gauge (using count from initial lock)
-                        Metrics::set_discovery_workers_discovered(
-                            metrics_labels::DISCOVERY_KUBERNETES,
-                            tracked_count,
-                        );
                     }
                     Err(e) => {
                         error!(
@@ -508,10 +513,6 @@ async fn handle_pod_event(
                             metrics_labels::DISCOVERY_KUBERNETES,
                             metrics_labels::REGISTRATION_FAILED,
                         );
-
-                        if let Ok(mut tracker) = tracked_pods.lock() {
-                            tracker.remove(pod_info);
-                        }
                     }
                 }
             } else {
@@ -520,13 +521,24 @@ async fn handle_pod_event(
                     worker_url
                 );
             }
-        } else {
-            // Pod already tracked - this is a duplicate event
-            Metrics::record_discovery_registration(
-                metrics_labels::DISCOVERY_KUBERNETES,
-                metrics_labels::REGISTRATION_DUPLICATE,
-            );
         }
+
+        // Update workers discovered gauge (using count from initial lock)
+        Metrics::set_discovery_workers_discovered(
+            metrics_labels::DISCOVERY_KUBERNETES,
+            tracked_count,
+        );
+    } else if should_add {
+        // Pod is not healthy, but we still tracked it - remove it
+        if let Ok(mut tracker) = tracked_pods.lock() {
+            tracker.remove(pod_info);
+        }
+    } else {
+        // Pod already tracked - this is a duplicate event
+        Metrics::record_discovery_registration(
+            metrics_labels::DISCOVERY_KUBERNETES,
+            metrics_labels::REGISTRATION_DUPLICATE,
+        );
     }
 }
 
@@ -534,10 +546,8 @@ async fn handle_pod_deletion(
     pod_info: &PodInfo,
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
-    port: u16,
+    ports: &[u16],
 ) {
-    let worker_url = pod_info.worker_url(port);
-
     // Remove pod and get remaining count in single lock acquisition
     let (was_tracked, remaining_count) = {
         let mut tracked = match tracked_pods.lock() {
@@ -552,47 +562,56 @@ async fn handle_pod_deletion(
     };
 
     if was_tracked {
-        info!(
-            "Removing pod: {} | type: {:?} | url: {}",
-            pod_info.name, pod_info.pod_type, worker_url
-        );
+        // Remove worker for each port
+        for port in ports {
+            let worker_url = pod_info.worker_url(*port);
 
-        let job = Job::RemoveWorker {
-            url: worker_url.clone(),
-        };
+            info!(
+                "Removing pod: {} | type: {:?} | url: {}",
+                pod_info.name, pod_info.pod_type, worker_url
+            );
 
-        if let Some(job_queue) = app_context.worker_job_queue.get() {
-            if let Err(e) = job_queue.submit(job).await {
-                error!(
-                    "Failed to submit worker removal job for {}: {}",
-                    worker_url, e
-                );
+            let job = Job::RemoveWorker {
+                url: worker_url.clone(),
+            };
+
+            if let Some(job_queue) = app_context.worker_job_queue.get() {
+                if let Err(e) = job_queue.submit(job).await {
+                    error!(
+                        "Failed to submit worker removal job for {}: {}",
+                        worker_url, e
+                    );
+                } else {
+                    debug!("Submitted worker removal job for {}", worker_url);
+
+                    // Layer 4: Record deregistration from K8s pod deletion
+                    Metrics::record_discovery_deregistration(
+                        metrics_labels::DISCOVERY_KUBERNETES,
+                        metrics_labels::DEREGISTRATION_POD_DELETED,
+                    );
+                }
             } else {
-                debug!("Submitted worker removal job for {}", worker_url);
-
-                // Layer 4: Record deregistration from K8s pod deletion
-                Metrics::record_discovery_deregistration(
-                    metrics_labels::DISCOVERY_KUBERNETES,
-                    metrics_labels::DEREGISTRATION_POD_DELETED,
-                );
-
-                // Update workers discovered gauge (using count from initial lock)
-                Metrics::set_discovery_workers_discovered(
-                    metrics_labels::DISCOVERY_KUBERNETES,
-                    remaining_count,
+                error!(
+                    "JobQueue not initialized, cannot remove worker {}",
+                    worker_url
                 );
             }
-        } else {
-            error!(
-                "JobQueue not initialized, cannot remove worker {}",
-                worker_url
+        }
+
+        // Update workers discovered gauge (using count from initial lock)
+        Metrics::set_discovery_workers_discovered(
+            metrics_labels::DISCOVERY_KUBERNETES,
+            remaining_count,
+        );
+    } else {
+        // Log for each port for debugging
+        for port in ports {
+            let worker_url = pod_info.worker_url(*port);
+            debug!(
+                "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
+                pod_info.name, pod_info.pod_type, worker_url
             );
         }
-    } else {
-        debug!(
-            "Pod deletion event for untracked/already removed pod: {} (type: {:?}). Worker URL: {}",
-            pod_info.name, pod_info.pod_type, worker_url
-        );
     }
 }
 
@@ -877,6 +896,7 @@ mod tests {
             selector: HashMap::new(),
             check_interval: Duration::from_secs(60),
             port: 8080,
+            ports: vec![8080],
             namespace: None,
             pd_mode: true,
             prefill_selector,
@@ -1168,13 +1188,13 @@ mod tests {
             is_router: false,
             mesh_port: None,
         };
-        let port = 8080u16;
+        let ports = [8080u16];
 
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
-            port,
+            &ports,
             false, // pd_mode = false
         )
         .await;
@@ -1196,13 +1216,13 @@ mod tests {
             is_router: false,
             mesh_port: None,
         };
-        let port = 8080u16;
+        let ports = [8080u16];
 
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
-            port,
+            &ports,
         )
         .await;
 
@@ -1223,13 +1243,13 @@ mod tests {
             is_router: false,
             mesh_port: None,
         };
-        let port = 8080u16;
+        let ports = [8080u16];
 
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
-            port,
+            &ports,
             true, // pd_mode = true for PD pod
         )
         .await;
@@ -1256,13 +1276,13 @@ mod tests {
             is_router: false,
             mesh_port: None,
         };
-        let port = 8080u16;
+        let ports = [8080u16];
 
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
-            port,
+            &ports,
             true, // pd_mode = true for PD pod
         )
         .await;
@@ -1296,13 +1316,13 @@ mod tests {
             tracked.insert(pod_info.clone());
         }
 
-        let port = 8080u16;
+        let ports = [8080u16];
 
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
-            port,
+            &ports,
         )
         .await;
 
@@ -1324,7 +1344,7 @@ mod tests {
             is_router: false,
             mesh_port: None,
         };
-        let port = 8080u16;
+        let ports = [8080u16];
 
         // Don't add pod to tracked set
 
@@ -1332,7 +1352,7 @@ mod tests {
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
-            port,
+            &ports,
         )
         .await;
 
@@ -1354,13 +1374,13 @@ mod tests {
             is_router: false,
             mesh_port: None,
         };
-        let port = 8080u16;
+        let ports = [8080u16];
 
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
-            port,
+            &ports,
             false, // pd_mode = false
         )
         .await;
@@ -1388,13 +1408,13 @@ mod tests {
             is_router: false,
             mesh_port: None,
         };
-        let port = 8080u16;
+        let ports = [8080u16];
 
         handle_pod_event(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
-            port,
+            &ports,
             true, // pd_mode = true
         )
         .await;
@@ -1428,17 +1448,113 @@ mod tests {
             tracked.insert(pod_info.clone());
         }
 
-        let port = 8080u16;
+        let ports = [8080u16];
 
         handle_pod_deletion(
             &pod_info,
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
-            port,
+            &ports,
         )
         .await;
 
         // Pod should be removed from tracking
         assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_event_multi_port() {
+        // Test that multiple workers are created when multiple ports are specified
+        let app_context = create_test_app_context().await;
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let pod_info = PodInfo {
+            name: "multi-port-pod".into(),
+            ip: "1.2.3.4".into(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
+        };
+        // Multiple ports - workers should be created for each port
+        let ports = [8080u16, 8081, 8082];
+
+        handle_pod_event(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&app_context),
+            &ports,
+            false, // pd_mode = false
+        )
+        .await;
+
+        // Pod should be tracked
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // In production, three workers would be created:
+        // - http://1.2.3.4:8080
+        // - http://1.2.3.4:8081
+        // - http://1.2.3.4:8082
+    }
+
+    #[tokio::test]
+    async fn test_handle_pod_deletion_multi_port() {
+        // Test that workers are removed for all ports when a pod is deleted
+        let app_context = create_test_app_context().await;
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let pod_info = PodInfo {
+            name: "multi-port-pod".into(),
+            ip: "1.2.3.4".into(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
+        };
+
+        // Add pod to tracked set first
+        {
+            let mut tracked = tracked_pods.lock().unwrap();
+            tracked.insert(pod_info.clone());
+        }
+
+        // Multiple ports - workers should be removed for each port
+        let ports = [8080u16, 8081, 8082];
+
+        handle_pod_deletion(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&app_context),
+            &ports,
+        )
+        .await;
+
+        // Pod should be removed from tracking
+        assert!(!tracked_pods.lock().unwrap().contains(&pod_info));
+
+        // Note: In tests with uninitialized queue, background jobs don't process
+        // In production, three workers would be removed for the three ports
+    }
+
+    #[test]
+    fn test_worker_url_multi_port() {
+        let pod_info = PodInfo {
+            name: "test-pod".into(),
+            ip: "10.0.0.1".into(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: None,
+            bootstrap_port: None,
+            is_router: false,
+            mesh_port: None,
+        };
+
+        // Test that worker_url generates correct URLs for different ports
+        assert_eq!(pod_info.worker_url(80), "http://10.0.0.1:80");
+        assert_eq!(pod_info.worker_url(8080), "http://10.0.0.1:8080");
+        assert_eq!(pod_info.worker_url(30000), "http://10.0.0.1:30000");
     }
 }

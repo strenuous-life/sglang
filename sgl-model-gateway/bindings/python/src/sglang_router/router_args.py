@@ -49,7 +49,7 @@ class RouterArgs:
     # Service discovery configuration
     service_discovery: bool = False
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
-    service_discovery_port: int = 80
+    service_discovery_ports: List[int] = dataclasses.field(default_factory=lambda: [80])
     service_discovery_namespace: Optional[str] = None
     # PD service discovery configuration
     prefill_selector: Dict[str, str] = dataclasses.field(default_factory=dict)
@@ -434,10 +434,11 @@ class RouterArgs:
             help="Label selector for Kubernetes service discovery (format: key1=value1 key2=value2)",
         )
         k8s_group.add_argument(
-            f"--{prefix}service-discovery-port",
+            f"--{prefix}service-discovery-ports",
             type=int,
-            default=RouterArgs.service_discovery_port,
-            help="Port to use for discovered worker pods",
+            nargs="+",
+            default=[80],
+            help="Ports to use for discovered worker pods (can specify multiple ports)",
         )
         k8s_group.add_argument(
             f"--{prefix}service-discovery-namespace",
